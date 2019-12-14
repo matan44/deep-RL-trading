@@ -1,170 +1,112 @@
-from lib import *
+import os
+import time
+import datetime
+import numpy as np
 
+from utils import makedirs
 
 
 class Simulator:
 
-	def play_one_episode(self, exploration, training=True, rand_price=True, print_t=False):
-
+	def play_episode(self, exploration, training=True, rand_price=True, print_t=False, get_ideal=False):
+		print('play_episode')
+		start_t = time.time()
 		state, valid_actions = self.env.reset(rand_price=rand_price)
 		done = False
-		env_t = 0
-		try:
-			env_t = self.env.t
-		except AttributeError:
-			pass
-
+		env_t = self.env.t + 1
 		cum_rewards = [np.nan] * env_t
 		actions = [np.nan] * env_t
+		ideal = [np.nan] * env_t
+		pqs = [[np.nan, np.nan, np.nan]] * env_t
 		states = [None] * env_t
 		prev_cum_rewards = 0.
-
 		while not done:
 			if print_t:
 				print(self.env.t)
-    
 
-			action = self.agent.act(state, exploration, valid_actions)
+			action, pq = self.agent.act(state, exploration, valid_actions)
 			next_state, reward, done, valid_actions = self.env.step(action)
-
-			cum_rewards.append(prev_cum_rewards+reward)
+			cum_rewards.append(prev_cum_rewards + reward)
 			prev_cum_rewards = cum_rewards[-1]
 			actions.append(action)
 			states.append(next_state)
-
+			pqs.append(pq)
+			ideal.append(np.nan if not get_ideal else self.env.get_ideal())
 			if training:
 				self.agent.remember(state, action, reward, next_state, done, valid_actions)
-				self.agent.replay()
 
 			state = next_state
 
-		return cum_rewards, actions, states
+		if training:
+			print('filled memory buffer', round(time.time() - start_t, 4), len(self.agent.memory))
+		return cum_rewards, actions, states, pqs, ideal
 
-
-	def train(self, n_episode, 
-		save_per_episode=10, exploration_decay=0.995, exploration_min=0.01, print_t=False, exploration_init=1.):
-
-		fld_model = os.path.join(self.fld_save,'model')
-		makedirs(fld_model)	# don't overwrite if already exists
-		with open(os.path.join(fld_model,'QModel.txt'),'w') as f:
+	def train(self, n_episode, exploration_decay, exploration_min, print_t, exploration_init):
+		fld_model = os.path.join(self.fld_save, 'model')
+		makedirs(fld_model)	 # don't overwrite if already exists
+		with open(os.path.join(fld_model,'QModel.txt'), 'w') as f:
 			f.write(self.agent.model.qmodel)
 
 		exploration = exploration_init
 		fld_save = os.path.join(self.fld_save,'training')
 
 		makedirs(fld_save)
-		MA_window = 100		# MA of performance
-		safe_total_rewards = []
-		explored_total_rewards = []
-		explorations = []
-		path_record = os.path.join(fld_save,'record.csv')
-
-		with open(path_record,'w') as f:
-			f.write('episode,game,exploration,explored,safe,MA_explored,MA_safe\n')
-
+		memory_filled = False
+		first_replay = True
+		n_training_episode = 0
 		for n in range(n_episode):
-
-			print('\ntraining...')
+			start_loop = time.time()
+			print(f'\ntraining: {n + 1}...')
 			exploration = max(exploration_min, exploration * exploration_decay)
-			explorations.append(exploration)
-			explored_cum_rewards, explored_actions, _ = self.play_one_episode(exploration, print_t=print_t)
-			explored_total_rewards.append(100.*explored_cum_rewards[-1]/self.env.max_profit)
-			safe_cum_rewards, safe_actions, _ = self.play_one_episode(0, training=False, rand_price=False, print_t=False)
-			safe_total_rewards.append(100.*safe_cum_rewards[-1]/self.env.max_profit)
+			cum_rewards, actions, _, qs, ideal = self.play_episode(exploration, print_t=print_t)
+			print('mem size, current mem', len(self.agent.memory),  self.agent.memory_size)
+			if len(self.agent.memory) >= self.agent.memory_size:
+				memory_filled = True
 
-			MA_total_rewards = np.median(explored_total_rewards[-MA_window:])
-			MA_safe_total_rewards = np.median(safe_total_rewards[-MA_window:])
+			if memory_filled:
+				if n_training_episode % 64 == 0:
+					print('starting replay ({}, {}): {}'.format(n, n_training_episode, datetime.datetime.now()))
+					start_t = time.time()
+					for i in range(self.replays):
+						start_l = time.time()
+						self.agent.replay()
+						if first_replay:
+							print('replayed one batch in', round(time.time() - start_l, 4))
+					first_replay = False
+					print('finished replay: {}'.format(datetime.datetime.now()))
+					print('{} replays done. replay time: ------- {}'.format(self.replays, round(time.time() - start_t, 4)))
+					start_l = time.time()
+					self.agent.save(fld_model)
+					print('saved model', round(time.time() - start_l, 4))
+				n_training_episode += 1
 
-			ss = [
-				str(n), self.env.title.replace(',',';'), '%.1f'%(exploration*100.), 
-				'%.1f'%(explored_total_rewards[-1]), '%.1f'%(safe_total_rewards[-1]),
-				'%.1f'%MA_total_rewards, '%.1f'%MA_safe_total_rewards,
-				]
-			
-			with open(path_record,'a') as f:
-				f.write(','.join(ss)+'\n')
-				print('\t'.join(ss))
+			print('looped once in', round(time.time() - start_loop, 4))
 
-			
-			if n%save_per_episode == 0:
-				print('saving results...')
-				self.agent.save(fld_model)
-
-				"""
-				self.visualizer.plot_a_episode(
-					self.env, self.agent.model, 
-					explored_cum_rewards, explored_actions,
-					safe_cum_rewards, safe_actions,
-					os.path.join(fld_save, 'episode_%i.png'%(n)))
-
-				self.visualizer.plot_episodes(
-					explored_total_rewards, safe_total_rewards, explorations, 
-					os.path.join(fld_save, 'total_rewards.png'),
-					MA_window)
-					"""
-
-
-
-
-	def test(self, n_episode, save_per_episode=10, subfld='testing'):
-
+	def test(self, n_episode, subfld):
 		fld_save = os.path.join(self.fld_save, subfld)
 		makedirs(fld_save)
-		MA_window = 100		# MA of performance
-		safe_total_rewards = []
-		path_record = os.path.join(fld_save,'record.csv')
+		path_record = os.path.join(fld_save, 'record.csv')
 
 		with open(path_record,'w') as f:
 			f.write('episode,game,pnl,rel,MA\n')
 
 		for n in range(n_episode):
-			print('\ntesting...')
-			
-			safe_cum_rewards, safe_actions, _ = self.play_one_episode(0, training=False, rand_price=True)
-			safe_total_rewards.append(100.*safe_cum_rewards[-1]/self.env.max_profit)
-			MA_safe_total_rewards = np.median(safe_total_rewards[-MA_window:])
-			ss = [str(n), self.env.title.replace(',',';'), 
-				'%.1f'%(safe_cum_rewards[-1]),
-				'%.1f'%(safe_total_rewards[-1]), 
-				'%.1f'%MA_safe_total_rewards]
-			
-			with open(path_record,'a') as f:
+			start_loop = time.time()
+			print('testing...')
+			cum_rewards, actions, states, pqs, ideal = self.play_episode(0, training=False, get_ideal=True)
+			ss = [str(n), self.env.title.replace(',',';'),  str(cum_rewards[-1]), str(np.nanmedian(ideal))]
+			with open(path_record, 'a') as f:
 				f.write(','.join(ss)+'\n')
 				print('\t'.join(ss))
 
-			
-			if n%save_per_episode == 0:
-				print('saving results...')
+			fig_path = os.path.join(fld_save, f'episode_{n}.png')
+			self.visualizer.visualise_episode(self.env, cum_rewards, actions, pqs, ideal, fig_path)
+			print('looped once in', round(time.time() - start_loop, 4))
+		return path_record
 
-				"""
-				self.visualizer.plot_a_episode(
-					self.env, self.agent.model, 
-					[np.nan]*len(safe_cum_rewards), [np.nan]*len(safe_actions),
-					safe_cum_rewards, safe_actions,
-					os.path.join(fld_save, 'episode_%i.png'%(n)))
-
-				self.visualizer.plot_episodes(
-					None, safe_total_rewards, None, 
-					os.path.join(fld_save, 'total_rewards.png'),
-					MA_window)
-					"""
-					
-
-
-
-	def __init__(self, agent, env, 
-		visualizer, fld_save):
-
+	def __init__(self, agent, env, visualizer, fld_save, replays=24):
+		self.replays = replays
 		self.agent = agent
 		self.env = env
 		self.visualizer = visualizer
 		self.fld_save = fld_save
-
-
-
-
-
-if __name__ == '__main__':
-	#print 'episode%i, init%i'%(1,2)
-	a = [1,2,3]
-	print(np.mean(a[-100:]))
